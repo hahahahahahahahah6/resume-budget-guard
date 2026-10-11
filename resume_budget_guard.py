@@ -7,18 +7,21 @@ resumed run. This tool keeps an external ledger of cumulative spend and wraps
 `claude` so a resume can never silently reset the budget.
 
 Usage:
-    rbg init --cap 5.00
+    rbg init --cap 5.00 [--reset-at 2026-10-12T07:00:00Z]
     rbg run -- claude -p --resume <session-id> "do the thing"
     rbg run --cap 10 --session-key day -- claude -p "other thing"
     rbg sync --session <session-id>
     rbg status [--session <session-id>]
+    rbg wait --until-reset [--timeout 3600] [--poll-interval 60]
     rbg reset
 
-Exit codes: 0 ok, 2 usage error, 3 blocked (budget exhausted).
+Exit codes: 0 ok, 1 wait timed out, 2 usage error, 3 blocked (budget exhausted).
 Any other exit code is passed through from the wrapped `claude` process.
 
 Stdlib only. Python 3.9+.
 """
+
+__version__ = "0.2.0"
 
 import argparse
 import datetime
@@ -27,12 +30,20 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 
 APP_DIR = os.path.expanduser("~/.resume-budget-guard")
 CONFIG_PATH = os.path.join(APP_DIR, "config.json")
 LEDGER_PATH = os.path.join(APP_DIR, "ledger.jsonl")
 
 EXIT_BLOCKED = 3
+EXIT_TIMEOUT = 1
+
+# Env override for the ledger path (power users + interop with subagent-budget:
+# point RBG_LEDGER_PATH at its ledger.jsonl to read a shared spend history).
+ENV_LEDGER_PATH = "RBG_LEDGER_PATH"
+# Env override for the quota reset time, same format as --reset-at / config.
+ENV_RESET_AT = "RBG_RESET_AT"
 
 # USD per million tokens. Estimates only (used for transcript fallback);
 # the primary cost source is claude's own `total_cost_usd`.
@@ -70,11 +81,15 @@ def save_config(cfg):
         json.dump(cfg, f, indent=2)
 
 
+def _ledger_path():
+    return os.environ.get(ENV_LEDGER_PATH) or LEDGER_PATH
+
+
 def read_ledger():
     """Return list of ledger records (dicts). Missing/corrupt lines are skipped."""
     records = []
     try:
-        with open(LEDGER_PATH) as f:
+        with open(_ledger_path()) as f:
             for line in f:
                 line = line.strip()
                 if not line:
@@ -92,7 +107,7 @@ def append_ledger(record):
     _ensure_dir()
     record = dict(record)
     record.setdefault("ts", datetime.datetime.now(datetime.timezone.utc).isoformat())
-    with open(LEDGER_PATH, "a") as f:
+    with open(_ledger_path(), "a") as f:
         f.write(json.dumps(record) + "\n")
 
 
@@ -206,8 +221,19 @@ def transcript_cost(session_id, projects_dir=None):
 
 
 def cmd_init(args):
-    save_config({"cap_usd": args.cap})
-    print("initialized: cap $%.2f -> %s" % (args.cap, CONFIG_PATH))
+    cfg = load_config()
+    cfg["cap_usd"] = args.cap
+    if args.reset_at:
+        reset = _parse_reset_at(args.reset_at)
+        if reset is None:
+            print("error: could not parse --reset-at %r (use ISO-8601, e.g. 2026-10-12T07:00:00Z)"
+                  % args.reset_at, file=sys.stderr)
+            return 2
+        cfg["reset_at"] = reset.isoformat()
+    save_config(cfg)
+    extra = " (quota reset %s)" % cfg["reset_at"] if cfg.get("reset_at") else ""
+    print("initialized: cap $%.2f%s -> %s" % (args.cap, extra, CONFIG_PATH))
+    return 0
 
 
 def cmd_run(args):
@@ -300,11 +326,71 @@ def cmd_sync(args):
     return 0
 
 
+def _parse_reset_at(value):
+    """Parse an ISO-8601 timestamp (trailing Z allowed). Naive values are
+    assumed to be local time. Returns an aware datetime, or None."""
+    if not value:
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        dt = datetime.datetime.fromisoformat(text)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.astimezone()  # assume local
+    return dt
+
+
+def quota_reset_time(flag_value=None):
+    """Resolve the configured quota reset time.
+
+    Priority: --reset-at flag > RBG_RESET_AT env > config reset_at.
+    Returns an aware datetime, or None if nothing is configured.
+    """
+    raw = flag_value or os.environ.get(ENV_RESET_AT) or load_config().get("reset_at")
+    return _parse_reset_at(raw) if raw else None
+
+
+def cmd_wait(args):
+    reset = quota_reset_time(args.reset_at)
+    if reset is None:
+        print("error: no quota reset time configured. Set one with "
+              "`rbg init --cap N --reset-at <ISO-8601>`, the --reset-at flag, "
+              "or the RBG_RESET_AT env var.", file=sys.stderr)
+        return 2
+    interval = max(1.0, args.poll_interval)
+    timeout = args.timeout
+    start = datetime.datetime.now(datetime.timezone.utc)
+    print("waiting for quota reset at %s (timeout %s)" % (
+        reset.isoformat(), "%ds" % timeout if timeout else "none"))
+    while True:
+        now = datetime.datetime.now(datetime.timezone.utc)
+        if now >= reset:
+            print("quota reset reached (%s)." % reset.isoformat())
+            return 0
+        if timeout is not None and (now - start).total_seconds() >= timeout:
+            print("timed out after %ds; quota not yet reset (reset at %s)."
+                  % (timeout, reset.isoformat()), file=sys.stderr)
+            return EXIT_TIMEOUT
+        remaining = int((reset - now).total_seconds())
+        print("quota resets in ~%d:%02d:%02d; checking again in %ds"
+              % (remaining // 3600, (remaining % 3600) // 60, remaining % 60, interval),
+              flush=True)
+        try:
+            time.sleep(min(interval, max(1.0, (reset - now).total_seconds())))
+        except KeyboardInterrupt:
+            print("interrupted.", file=sys.stderr)
+            return 130
+
+
 def cmd_status(args):
     records = read_ledger()
     cfg = load_config()
     cap = cfg.get("cap_usd")
-    keys = sorted({r.get("session_key", "") for r in records if r.get("session_key")})
+    keys = sorted({r.get("session_key") or r.get("session_id") or "(unknown)"
+                   for r in records})
     if args.session:
         keys = [k for k in keys if args.session in k]
     if not keys:
@@ -320,10 +406,11 @@ def cmd_status(args):
 
 
 def cmd_reset(args):
-    if os.path.exists(LEDGER_PATH):
+    path = _ledger_path()
+    if os.path.exists(path):
         stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
-        archived = LEDGER_PATH + "." + stamp + ".bak"
-        shutil.move(LEDGER_PATH, archived)
+        archived = path + "." + stamp + ".bak"
+        shutil.move(path, archived)
         print("ledger archived to %s" % archived)
     else:
         print("ledger already empty.")
@@ -337,6 +424,8 @@ def main(argv=None):
 
     pi = sub.add_parser("init", help="set the spend cap")
     pi.add_argument("--cap", type=float, required=True, help="cap in USD")
+    pi.add_argument("--reset-at", default=None,
+                    help="quota reset time (ISO-8601, e.g. 2026-10-12T07:00:00Z) for `wait`")
     pi.set_defaults(func=cmd_init)
 
     pr = sub.add_parser("run", help="wrap a claude invocation with the guard")
@@ -358,6 +447,17 @@ def main(argv=None):
 
     pz = sub.add_parser("reset", help="archive the ledger")
     pz.set_defaults(func=cmd_reset)
+
+    pw = sub.add_parser("wait", help="block until the API quota resets")
+    pw.add_argument("--until-reset", action="store_true", required=True,
+                    help="exit 0 once the configured quota reset time is reached")
+    pw.add_argument("--timeout", type=int, default=None,
+                    help="give up after N seconds (exit 1)")
+    pw.add_argument("--poll-interval", type=float, default=60,
+                    help="seconds between checks (default 60)")
+    pw.add_argument("--reset-at", default=None,
+                    help="override the configured quota reset time (ISO-8601)")
+    pw.set_defaults(func=cmd_wait)
 
     args = p.parse_args(argv)
     # argparse REMAINDER keeps the leading `--`; drop it.
