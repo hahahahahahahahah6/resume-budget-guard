@@ -155,6 +155,78 @@ class RbgTest(unittest.TestCase):
         self.assertIn("a: $1.50 / $5.00", out)
         self.assertIn("b: $2.50 / $5.00", out)
 
+    def _reset_at(self, delta_seconds):
+        import datetime
+        dt = datetime.datetime.now(datetime.timezone.utc) + datetime.timedelta(
+            seconds=delta_seconds)
+        return dt.isoformat()
+
+    def _quiet(self, argv):
+        import io
+        from contextlib import redirect_stdout, redirect_stderr
+        buf = io.StringIO()
+        with redirect_stdout(buf), redirect_stderr(buf):
+            return rbg.main(argv)
+
+    # 7. wait exits 0 immediately when the reset time is already past.
+    def test_wait_reset_already_past(self):
+        rbg.save_config({"cap_usd": 5.0, "reset_at": self._reset_at(-3600)})
+        rc = self._quiet(["wait", "--until-reset", "--poll-interval", "1"])
+        self.assertEqual(rc, 0)
+
+    # 8. wait exits 2 when no reset time is configured anywhere.
+    def test_wait_no_reset_configured(self):
+        os.environ.pop("RBG_RESET_AT", None)
+        rc = self._quiet(["wait", "--until-reset"])
+        self.assertEqual(rc, 2)
+
+    # 9. wait times out (exit 1) when the reset is beyond --timeout.
+    def test_wait_times_out(self):
+        rbg.save_config({"cap_usd": 5.0, "reset_at": self._reset_at(3600)})
+        rc = self._quiet(["wait", "--until-reset", "--timeout", "2",
+                          "--poll-interval", "0.5"])
+        self.assertEqual(rc, rbg.EXIT_TIMEOUT)
+
+    # 10. init --reset-at stores the reset time in config.
+    def test_init_reset_at(self):
+        rc = self._quiet(["init", "--cap", "5", "--reset-at", "2026-10-12T07:00:00Z"])
+        self.assertEqual(rc, 0)
+        cfg = rbg.load_config()
+        self.assertEqual(cfg["cap_usd"], 5.0)
+        self.assertIn("2026-10-12", cfg["reset_at"])
+        self.assertIn("+00:00", cfg["reset_at"])
+
+    # 11. init --reset-at rejects garbage timestamps.
+    def test_init_reset_at_invalid(self):
+        rc = self._quiet(["init", "--cap", "5", "--reset-at", "not-a-time"])
+        self.assertEqual(rc, 2)
+
+    # 12. RBG_LEDGER_PATH env override redirects the ledger (interop hook).
+    def test_ledger_path_env_override(self):
+        other = os.path.join(self.tmp, "shared-ledger.jsonl")
+        os.environ["RBG_LEDGER_PATH"] = other
+        rbg.append_ledger({"session_key": "x", "kind": "invocation", "cost_usd": 3.0})
+        self.assertTrue(os.path.exists(other))
+        self.assertFalse(os.path.exists(rbg.LEDGER_PATH))
+        recs = rbg.read_ledger()
+        self.assertEqual(len(recs), 1)
+        self.assertAlmostEqual(rbg.cumulative_spent(recs, "x"), 3.0)
+        del os.environ["RBG_LEDGER_PATH"]
+
+    # 13. _parse_reset_at handles Z suffix and naive local times.
+    def test_parse_reset_at(self):
+        import datetime
+        dt = rbg._parse_reset_at("2026-10-12T07:00:00Z")
+        self.assertEqual(dt.tzinfo.utcoffset(None), datetime.timedelta(0))
+        dt2 = rbg._parse_reset_at("2026-10-12 07:00:00")
+        self.assertIsNotNone(dt2.tzinfo)
+        self.assertIsNone(rbg._parse_reset_at("garbage"))
+        self.assertIsNone(rbg._parse_reset_at(""))
+        # env override wins when no flag given
+        os.environ["RBG_RESET_AT"] = "2026-10-13T00:00:00Z"
+        self.assertIn("2026-10-13", rbg.quota_reset_time().isoformat())
+        del os.environ["RBG_RESET_AT"]
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)
